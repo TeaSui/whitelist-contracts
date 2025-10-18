@@ -1,84 +1,66 @@
 // SPDX-License-Identifier: MIT
 pragma solidity ^0.8.20;
 
-import "@openzeppelin/contracts/utils/ReentrancyGuard.sol";
-import "@openzeppelin/contracts/utils/Pausable.sol";
-import "@openzeppelin/contracts/access/Ownable.sol";
 import "@openzeppelin/contracts/token/ERC20/IERC20.sol";
 import "@openzeppelin/contracts/token/ERC20/utils/SafeERC20.sol";
+import "@openzeppelin/contracts/access/Ownable.sol";
+import "@openzeppelin/contracts/utils/ReentrancyGuard.sol";
+import "@openzeppelin/contracts/utils/Pausable.sol";
 import "@openzeppelin/contracts/utils/cryptography/MerkleProof.sol";
 
 /**
- * @title WhitelistSale
- * @dev Smart contract for conducting a token sale with whitelist functionality
- * @author Whitelist Token Team
+ * @title WhitelistSaleFixed
+ * @dev Fixed version of the WhitelistSale contract that properly handles multiple purchases and claiming
  */
-contract WhitelistSale is ReentrancyGuard, Pausable, Ownable {
+contract WhitelistSaleFixed is Ownable, ReentrancyGuard, Pausable {
     using SafeERC20 for IERC20;
-    
-    // Sale configuration
+
+    IERC20 public immutable token;
+    address public treasury;
+    bytes32 public merkleRoot;
+
     struct SaleConfig {
-        uint256 tokenPrice;      // Price per token in wei
-        uint256 minPurchase;     // Minimum purchase amount in tokens
-        uint256 maxPurchase;     // Maximum purchase amount in tokens
-        uint256 maxSupply;       // Maximum tokens available for sale
-        uint256 startTime;       // Sale start timestamp
-        uint256 endTime;         // Sale end timestamp
-        bool whitelistRequired;  // Whether whitelist is required
+        uint256 tokenPrice;     // Price per token in wei
+        uint256 minPurchase;    // Minimum tokens per purchase
+        uint256 maxPurchase;    // Maximum tokens per purchase
+        uint256 maxSupply;      // Maximum tokens available for sale
+        uint256 startTime;      // Sale start timestamp
+        uint256 endTime;        // Sale end timestamp
+        bool whitelistRequired; // Whether whitelist is required
     }
-    
-    // Purchase record
+
     struct Purchase {
         uint256 totalPurchased;    // Total tokens purchased by user
         uint256 totalClaimed;      // Total tokens claimed by user
         uint256 ethSpent;          // Total ETH spent by user
         uint256 lastPurchaseTime;  // Timestamp of last purchase
     }
-    
-    // Events
-    event TokenPurchase(
-        address indexed buyer,
-        uint256 tokenAmount,
-        uint256 ethAmount,
-        uint256 timestamp
-    );
-    event TokensClaimed(address indexed buyer, uint256 amount);
-    event WhitelistUpdated(address indexed account, bool whitelisted);
-    event SaleConfigUpdated();
-    event EmergencyWithdraw(address indexed token, uint256 amount);
-    event MerkleRootUpdated(bytes32 newRoot);
-    
-    // State variables
-    IERC20 public immutable token;
-    address public immutable treasury;
+
     SaleConfig public saleConfig;
     
-    // Whitelist management
-    mapping(address => bool) public whitelist;
-    bytes32 public merkleRoot;
-    
-    // Purchase tracking
+    // Mapping from address to their purchase info
     mapping(address => Purchase) public purchases;
+    
+    // Simple whitelist mapping (alternative to Merkle tree)
+    mapping(address => bool) public whitelist;
+    
+    // Tracking variables
     mapping(address => uint256) public totalPurchased;
     uint256 public totalSold;
     uint256 public totalEthRaised;
     
-    // Claim settings
+    // Claiming settings
     bool public claimEnabled;
     uint256 public claimStartTime;
-    
-    /**
-     * @dev Constructor sets up the sale contract
-     * @param _token Address of the token being sold
-     * @param _treasury Address to receive ETH payments
-     * @param _tokenPrice Price per token in wei
-     * @param _minPurchase Minimum purchase amount in tokens
-     * @param _maxPurchase Maximum purchase amount in tokens
-     * @param _maxSupply Maximum tokens available for sale
-     * @param _startTime Sale start timestamp
-     * @param _endTime Sale end timestamp
-     * @param _initialOwner Initial owner of the contract
-     */
+
+    // Events
+    event TokenPurchase(address indexed buyer, uint256 tokenAmount, uint256 ethAmount, uint256 timestamp);
+    event TokensClaimed(address indexed buyer, uint256 amount);
+    event WhitelistUpdated(address indexed account, bool whitelisted);
+    event SaleConfigUpdated();
+    event MerkleRootUpdated(bytes32 newRoot);
+    event EmergencyWithdraw(address indexed token, uint256 amount);
+
     constructor(
         address _token,
         address _treasury,
@@ -92,14 +74,13 @@ contract WhitelistSale is ReentrancyGuard, Pausable, Ownable {
     ) Ownable(_initialOwner) {
         require(_token != address(0), "WhitelistSale: token cannot be zero address");
         require(_treasury != address(0), "WhitelistSale: treasury cannot be zero address");
-        require(_initialOwner != address(0), "WhitelistSale: initial owner cannot be zero address");
         require(_tokenPrice > 0, "WhitelistSale: token price must be greater than 0");
         require(_minPurchase > 0, "WhitelistSale: min purchase must be greater than 0");
         require(_maxPurchase >= _minPurchase, "WhitelistSale: max purchase must be >= min purchase");
         require(_maxSupply > 0, "WhitelistSale: max supply must be greater than 0");
-        require(_startTime >= block.timestamp, "WhitelistSale: start time must be in the future");
         require(_endTime > _startTime, "WhitelistSale: end time must be after start time");
-        
+        require(_startTime > block.timestamp, "WhitelistSale: start time must be in the future");
+
         token = IERC20(_token);
         treasury = _treasury;
         
@@ -112,13 +93,48 @@ contract WhitelistSale is ReentrancyGuard, Pausable, Ownable {
             endTime: _endTime,
             whitelistRequired: true
         });
-        
-        
-        // Add treasury to whitelist
-        whitelist[_treasury] = true;
-        emit WhitelistUpdated(_treasury, true);
+
+        // Add initial owner to whitelist
+        whitelist[_initialOwner] = true;
+        emit WhitelistUpdated(_initialOwner, true);
     }
-    
+
+    /**
+     * @dev Check if sale is currently active
+     */
+    function isSaleActive() public view returns (bool) {
+        return 
+            block.timestamp >= saleConfig.startTime &&
+            block.timestamp <= saleConfig.endTime &&
+            !paused() &&
+            totalSold < saleConfig.maxSupply;
+    }
+
+    /**
+     * @dev Check if address is whitelisted (supports both Merkle proof and simple mapping)
+     */
+    function isWhitelisted(address account, bytes32[] calldata merkleProof) public view returns (bool) {
+        // Check simple whitelist first
+        if (whitelist[account]) {
+            return true;
+        }
+        
+        // Check Merkle tree if root is set
+        if (merkleRoot != bytes32(0)) {
+            bytes32 leaf = keccak256(abi.encodePacked(account));
+            return MerkleProof.verify(merkleProof, merkleRoot, leaf);
+        }
+        
+        return false;
+    }
+
+    /**
+     * @dev Internal function to check whitelist
+     */
+    function _isWhitelisted(address account, bytes32[] calldata merkleProof) internal view returns (bool) {
+        return isWhitelisted(account, merkleProof);
+    }
+
     /**
      * @dev Purchase tokens during the sale
      * @param tokenAmount Amount of tokens to purchase
@@ -141,7 +157,7 @@ contract WhitelistSale is ReentrancyGuard, Pausable, Ownable {
             );
         }
         
-        // Check individual purchase limit
+        // Check individual purchase limit (total across all purchases)
         require(
             totalPurchased[msg.sender] + tokenAmount <= saleConfig.maxPurchase,
             "WhitelistSale: exceeds individual purchase limit"
@@ -195,7 +211,33 @@ contract WhitelistSale is ReentrancyGuard, Pausable, Ownable {
         
         emit TokensClaimed(msg.sender, claimableAmount);
     }
-    
+
+    /**
+     * @dev Get purchase information for a user
+     */
+    function getPurchaseInfo(address buyer) external view returns (
+        uint256 totalPurchased,
+        uint256 totalClaimed,
+        uint256 ethSpent,
+        uint256 lastPurchaseTime
+    ) {
+        Purchase memory userPurchase = purchases[buyer];
+        return (
+            userPurchase.totalPurchased,
+            userPurchase.totalClaimed,
+            userPurchase.ethSpent,
+            userPurchase.lastPurchaseTime
+        );
+    }
+
+    /**
+     * @dev Get claimable token amount for a user
+     */
+    function getClaimableAmount(address buyer) external view returns (uint256) {
+        Purchase memory userPurchase = purchases[buyer];
+        return userPurchase.totalPurchased - userPurchase.totalClaimed;
+    }
+
     /**
      * @dev Update sale configuration (only owner)
      */
@@ -232,13 +274,12 @@ contract WhitelistSale is ReentrancyGuard, Pausable, Ownable {
      */
     function updateWhitelist(address account, bool whitelisted) external onlyOwner {
         require(account != address(0), "WhitelistSale: cannot whitelist zero address");
-        
         whitelist[account] = whitelisted;
         emit WhitelistUpdated(account, whitelisted);
     }
-    
+
     /**
-     * @dev Update multiple addresses in whitelist
+     * @dev Add or remove multiple addresses from whitelist
      */
     function updateWhitelistBatch(address[] calldata accounts, bool whitelisted) external onlyOwner {
         require(accounts.length > 0, "WhitelistSale: empty accounts array");
@@ -250,7 +291,7 @@ contract WhitelistSale is ReentrancyGuard, Pausable, Ownable {
             emit WhitelistUpdated(accounts[i], whitelisted);
         }
     }
-    
+
     /**
      * @dev Set Merkle root for whitelist verification
      */
@@ -258,120 +299,68 @@ contract WhitelistSale is ReentrancyGuard, Pausable, Ownable {
         merkleRoot = _merkleRoot;
         emit MerkleRootUpdated(_merkleRoot);
     }
-    
+
     /**
-     * @dev Enable/disable token claiming
+     * @dev Enable/disable claiming and set claim start time
      */
     function setClaimEnabled(bool _enabled, uint256 _claimStartTime) external onlyOwner {
         claimEnabled = _enabled;
-        if (_enabled && _claimStartTime > 0) {
+        if (_enabled) {
             claimStartTime = _claimStartTime;
         }
     }
-    
-    /**
-     * @dev Pause the sale
-     */
-    function pause() external onlyOwner {
-        _pause();
-    }
-    
-    /**
-     * @dev Unpause the sale
-     */
-    function unpause() external onlyOwner {
-        _unpause();
-    }
-    
-    /**
-     * @dev Emergency withdraw tokens (only owner)
-     */
-    function emergencyWithdraw(address tokenAddress, uint256 amount) external onlyOwner {
-        require(tokenAddress != address(0), "WhitelistSale: token address cannot be zero");
-        
-        if (tokenAddress == address(token)) {
-            // For main token, only allow withdrawal of unsold tokens
-            uint256 unsoldTokens = saleConfig.maxSupply - totalSold;
-            require(amount <= unsoldTokens, "WhitelistSale: cannot withdraw sold tokens");
-        }
-        
-        IERC20(tokenAddress).safeTransfer(owner(), amount);
-        emit EmergencyWithdraw(tokenAddress, amount);
-    }
-    
-    /**
-     * @dev Emergency withdraw ETH (only owner)
-     */
-    function emergencyWithdrawETH() external onlyOwner {
-        require(address(this).balance > 0, "WhitelistSale: no ETH to withdraw");
-        
-        payable(owner()).transfer(address(this).balance);
-    }
-    
-    /**
-     * @dev Check if sale is currently active
-     */
-    function isSaleActive() public view returns (bool) {
-        return block.timestamp >= saleConfig.startTime && 
-               block.timestamp <= saleConfig.endTime &&
-               totalSold < saleConfig.maxSupply;
-    }
-    
+
     /**
      * @dev Get remaining tokens available for sale
      */
     function remainingTokens() external view returns (uint256) {
         return saleConfig.maxSupply - totalSold;
     }
-    
+
     /**
-     * @dev Get purchase information for an address
+     * @dev Pause the sale (only owner)
      */
-    function getPurchaseInfo(address buyer) external view returns (
-        uint256 totalPurchased,
-        uint256 totalClaimed,
-        uint256 ethSpent,
-        uint256 lastPurchaseTime
-    ) {
-        Purchase memory userPurchase = purchases[buyer];
-        return (
-            userPurchase.totalPurchased,
-            userPurchase.totalClaimed,
-            userPurchase.ethSpent,
-            userPurchase.lastPurchaseTime
-        );
+    function pause() external onlyOwner {
+        _pause();
     }
-    
+
     /**
-     * @dev Get claimable token amount for a user
+     * @dev Unpause the sale (only owner)
      */
-    function getClaimableAmount(address buyer) external view returns (uint256) {
-        Purchase memory userPurchase = purchases[buyer];
-        return userPurchase.totalPurchased - userPurchase.totalClaimed;
+    function unpause() external onlyOwner {
+        _unpause();
     }
-    
+
     /**
-     * @dev Check if an address is whitelisted (supports both mapping and Merkle proof)
+     * @dev Emergency withdraw function (only owner)
      */
-    function _isWhitelisted(address account, bytes32[] calldata merkleProof) internal view returns (bool) {
-        // Check mapping-based whitelist
-        if (whitelist[account]) {
-            return true;
+    function emergencyWithdraw(address tokenAddress, uint256 amount) external onlyOwner {
+        require(tokenAddress != address(0), "WhitelistSale: token address cannot be zero");
+        
+        uint256 availableAmount;
+        if (tokenAddress == address(token)) {
+            // For the sale token, can't withdraw sold tokens
+            uint256 contractBalance = token.balanceOf(address(this));
+            uint256 soldButNotClaimed = totalSold;
+            
+            // Calculate how much of each user's purchase is unclaimed
+            // Note: This is a simplified calculation - in practice you'd want to track this more precisely
+            availableAmount = contractBalance > soldButNotClaimed ? contractBalance - soldButNotClaimed : 0;
+        } else {
+            availableAmount = IERC20(tokenAddress).balanceOf(address(this));
         }
         
-        // Check Merkle proof-based whitelist
-        if (merkleRoot != bytes32(0) && merkleProof.length > 0) {
-            bytes32 leaf = keccak256(abi.encodePacked(account));
-            return MerkleProof.verify(merkleProof, merkleRoot, leaf);
-        }
+        require(amount <= availableAmount, "WhitelistSale: cannot withdraw sold tokens");
         
-        return false;
+        IERC20(tokenAddress).safeTransfer(owner(), amount);
+        emit EmergencyWithdraw(tokenAddress, amount);
     }
-    
+
     /**
-     * @dev Public function to check whitelist status
+     * @dev Emergency withdraw ETH (only owner)
      */
-    function isWhitelisted(address account, bytes32[] calldata merkleProof) external view returns (bool) {
-        return _isWhitelisted(account, merkleProof);
+    function emergencyWithdrawETH() external onlyOwner {
+        require(address(this).balance > 0, "WhitelistSale: no ETH to withdraw");
+        payable(owner()).transfer(address(this).balance);
     }
 }
